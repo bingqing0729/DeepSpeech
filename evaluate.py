@@ -5,6 +5,8 @@ from __future__ import absolute_import, division, print_function
 import itertools
 import json
 import numpy as np
+import pandas as pd
+np.set_printoptions(threshold=3000)
 import os
 import pandas
 import progressbar
@@ -12,6 +14,7 @@ import sys
 import tables
 import tensorflow as tf
 
+from attrdict import AttrDict
 from collections import namedtuple
 from ds_ctcdecoder import ctc_beam_search_decoder_batch, Scorer
 from multiprocessing import Pool, cpu_count
@@ -20,9 +23,9 @@ from util.audio import audiofile_to_input_vector
 from util.config import Config, initialize_globals
 from util.flags import create_flags, FLAGS
 from util.logging import log_error
-from util.preprocess import preprocess
-from util.text import Alphabet, levenshtein
-from util.evaluate_tools import process_decode_result, calculate_report
+from util.preprocess import pmap, preprocess
+from util.text import Alphabet, ctc_label_dense_to_sparse, wer, levenshtein
+from pinyin.eval import pinyin2ch
 
 def split_data(dataset, batch_size):
     remainder = len(dataset) % batch_size
@@ -42,6 +45,43 @@ def pad_to_dense(jagged):
     for i, row in enumerate(jagged):
         padded[i, :len(row)] = row
     return padded
+
+
+def process_decode_result(item):
+    label, decoding, distance, loss = item
+    sample_wer = wer(label, decoding)
+    return AttrDict({
+        'src': label,
+        'res': decoding,
+        'loss': loss,
+        'distance': distance,
+        'wer': sample_wer,
+        'levenshtein': levenshtein(label.split(), decoding.split()),
+        'label_length': float(len(label.split())),
+    })
+
+
+def calculate_report(labels, decodings, distances, losses):
+    r'''
+    This routine will calculate a WER report.
+    It'll compute the `mean` WER and create ``Sample`` objects of the ``report_count`` top lowest
+    loss items from the provided WER results tuple (only items with WER!=0 and ordered by their WER).
+    '''
+    samples = pmap(process_decode_result, zip(labels, decodings, distances, losses))
+
+    total_levenshtein = sum(s.levenshtein for s in samples)
+    total_label_length = sum(s.label_length for s in samples)
+
+    # Getting the WER from the accumulated levenshteins and lengths
+    samples_wer = total_levenshtein / (total_label_length+0.0001)
+
+    # Order the remaining items by their loss (lowest loss on top)
+    samples.sort(key=lambda s: s.loss)
+
+    # Then order by WER (highest WER on top)
+    samples.sort(key=lambda s: s.wer, reverse=True)
+
+    return samples_wer, samples
 
 
 def evaluate(test_data, inference_graph):
@@ -68,7 +108,8 @@ def evaluate(test_data, inference_graph):
     test_data['features'] = test_data['features'].apply(create_windows)
 
     with tf.Session(config=Config.session_config) as session:
-        inputs, outputs, layers = inference_graph
+        #inputs, outputs, layers = inference_graph
+        inputs, outputs = inference_graph
 
         # Transpose to batch major for decoder
         transposed = tf.transpose(outputs['outputs'], [1, 0, 2])
@@ -76,17 +117,14 @@ def evaluate(test_data, inference_graph):
         labels_ph = tf.placeholder(tf.int32, [FLAGS.test_batch_size, None], name="labels")
         label_lengths_ph = tf.placeholder(tf.int32, [FLAGS.test_batch_size], name="label_lengths")
 
-        # We add 1 to all elements of the transcript to avoid any zero values
-        # since we use that as an end-of-sequence token for converting the batch
-        # into a SparseTensor. So here we convert the placeholder back into a
-        # SparseTensor and subtract ones to get the real labels.
-        sparse_labels = tf.contrib.layers.dense_to_sparse(labels_ph)
-        neg_ones = tf.SparseTensor(sparse_labels.indices, -1 * tf.ones_like(sparse_labels.values), sparse_labels.dense_shape)
-        sparse_labels = tf.sparse_add(sparse_labels, neg_ones)
-
+        sparse_labels = tf.cast(ctc_label_dense_to_sparse(labels_ph, label_lengths_ph, FLAGS.test_batch_size), tf.int32)
         loss = tf.nn.ctc_loss(labels=sparse_labels,
-                              inputs=layers['raw_logits'],
-                              sequence_length=inputs['input_lengths'])
+                              #inputs=layers['raw_logits'],
+                              inputs = outputs['outputs'],
+                              sequence_length=tf.to_int32(tf.ceil(inputs['input_lengths']/3)),
+                              ignore_longer_outputs_than_inputs=True
+                              #sequence_length=inputs['input_lengths'] 
+                              )
 
         # Create a saver using variables from the above newly created graph
         mapping = {v.op.name: v for v in tf.global_variables() if not v.op.name.startswith('previous_state_')}
@@ -111,16 +149,18 @@ def evaluate(test_data, inference_graph):
 
         # First pass, compute losses and transposed logits for decoding
         for batch in bar(split_data(test_data, FLAGS.test_batch_size)):
-            session.run(outputs['initialize_state'])
+            #session.run(outputs['initialize_state'])
 
             features = pad_to_dense(batch['features'].values)
             features_len = batch['features_len'].values
-            labels = pad_to_dense(batch['transcript'].values + 1)
+            labels = pad_to_dense(batch['transcript'].values)
+            #print(labels)
             label_lengths = batch['transcript_len'].values
 
             logits, loss_ = session.run([transposed, loss], feed_dict={
                 inputs['input']: features,
                 inputs['input_lengths']: features_len,
+                inputs['training_phase']: True,
                 labels_ph: labels,
                 label_lengths_ph: label_lengths
             })
@@ -143,29 +183,73 @@ def evaluate(test_data, inference_graph):
 
     # Second pass, decode logits and compute WER and edit distance metrics
     for logits, batch in bar(zip(logitses, split_data(test_data, FLAGS.test_batch_size))):
-        seq_lengths = batch['features_len'].values.astype(np.int32)
-        decoded = ctc_beam_search_decoder_batch(logits, seq_lengths, Config.alphabet, FLAGS.beam_width,
-                                                num_processes=num_processes, scorer=scorer)
-
+        #seq_lengths = batch['features_len'].values.astype(np.int32)
+        
+        s = np.shape(logits)
+        seq_lengths = np.int32(np.ones(s[0])*s[1])
+        #logits_0 = logits[0]
+        #print(logits_0)
+        #sm = np.exp(logits_0) / np.expand_dims(np.sum(np.exp(logits_0),axis=1),axis=1)
+        sm = np.exp(logits) / np.expand_dims(np.sum(np.exp(logits),axis=2),axis=2)
+        #index = np.argsort(sm)[:,-10:]
+        #for i in index:
+            #print([Config.alphabet.string_from_label(a) if a<396 else 'B' for a in i])
+        #print(np.sort(sm)[:,-5:])
+        #print(seq_lengths)
+        #decoded = ctc_beam_search_decoder_batch(sm, seq_lengths, Config.alphabet, FLAGS.beam_width,
+                                                #num_processes=num_processes, scorer=scorer)
+                                                
+        logits = tf.transpose(logits,[1,0,2]) # tf.nn.ctc_beam_search_decoder needs [batch, time, n]
+        decoded, _ = tf.nn.ctc_beam_search_decoder(logits, seq_lengths, beam_width=1)
+        
         ground_truths.extend(Config.alphabet.decode(l) for l in batch['transcript'])
-        predictions.extend(d[0][1] for d in decoded)
+        #predictions.extend(d[0][1] for d in decoded)
+        index = list(tf.Session().run(tf.sparse_tensor_to_dense(decoded[0])))
+        batch_words = []
+        for i in index:
+            words =  ''.join([Config.alphabet.string_from_label(a) for a in i])
+            #print(words)
+            batch_words.append(words)
+        
+        predictions.extend(w for w in batch_words)
+    
+    # get the origin text
+    origin = pd.read_csv('data/dev_clean.csv')
+    origin = list(origin.iloc[1000:1100,2])
+    characters = [pinyin2ch(''.join(p.split(' '))) if len(''.join(p.split(' '))) < 50 else '' for p in predictions]
+    origin_clean = []
+    characters_clean = []
+    for i in range(len(origin)):
+        if characters[i] != '':
+            origin_clean.append(origin[i])
+            characters_clean.append(characters[i])
 
-    distances = [levenshtein(a, b) for a, b in zip(ground_truths, predictions)]
+    #distances = [levenshtein(a, b) for a, b in zip(ground_truths, predictions)]
+    distances = [levenshtein(a, b)/float(len(a)) for a, b in zip(ground_truths, predictions)]
 
-    wer, cer, samples = calculate_report(ground_truths, predictions, distances, losses)
+    wer, samples = calculate_report(ground_truths, predictions, distances, losses)
+    mean_edit_distance = np.mean(distances)
     mean_loss = np.mean(losses)
+
+    distances_ch = [levenshtein(x, y)/float(len(x)) for x, y in zip(origin_clean, characters_clean)]
+    print(origin_clean)
+    print(characters_clean)
+    print('final CER: %f' % np.mean(distances_ch))
 
     # Take only the first report_count items
     report_samples = itertools.islice(samples, FLAGS.report_count)
 
     print('Test - WER: %f, CER: %f, loss: %f' %
-          (wer, cer, mean_loss))
+          (wer, mean_edit_distance, mean_loss))
     print('-' * 80)
     for sample in report_samples:
         print('WER: %f, CER: %f, loss: %f' %
               (sample.wer, sample.distance, sample.loss))
         print(' - src: "%s"' % sample.src)
         print(' - res: "%s"' % sample.res)
+        #pinyin_string = ''.join(sample.res.split(' '))
+        #if len(pinyin_string)<51:
+            #print(' - res: "%s"' % pinyin2ch(pinyin_string))
         print('-' * 80)
 
     return samples

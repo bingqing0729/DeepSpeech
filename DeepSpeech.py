@@ -7,6 +7,7 @@ import sys
 
 log_level_index = sys.argv.index('--log_level') + 1 if '--log_level' in sys.argv else 0
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = sys.argv[log_level_index] if log_level_index > 0 and log_level_index < len(sys.argv) else '3'
+os.environ['CUDA_VISIBLE_DEVICES'] = '4,5,6,7' 
 
 import evaluate
 import numpy as np
@@ -18,7 +19,10 @@ import traceback
 
 from ds_ctcdecoder import ctc_beam_search_decoder, Scorer
 from six.moves import zip, range
+from tensorflow.contrib.lite.python import tflite_convert
 from tensorflow.python.tools import freeze_graph
+from tensorflow.python.training import moving_averages
+from tensorflow.python.ops import control_flow_ops
 from util.audio import audiofile_to_input_vector
 from util.config import Config, initialize_globals
 from util.coordinator import TrainingCoordinator
@@ -28,17 +32,11 @@ from util.logging import log_info, log_error, log_debug, log_warn
 from util.preprocess import preprocess
 from util.text import Alphabet
 
-#TODO: remove once fully switched to 1.13
-try:
-    from tensorflow.contrib.lite.python import tflite_convert # 1.12
-except ImportError:
-    from tensorflow.lite.python import tflite_convert # 1.13
-
 
 # Graph Creation
 # ==============
 
-def variable_on_worker_level(name, shape, initializer):
+def variable_on_worker_level(name, shape, initializer,trainable=True):
     r'''
     Next we concern ourselves with graph creation.
     However, before we do so we must introduce a utility function ``variable_on_worker_level()``
@@ -52,11 +50,330 @@ def variable_on_worker_level(name, shape, initializer):
 
     with tf.device(device):
         # Create or get apropos variable
-        var = tf.get_variable(name=name, shape=shape, initializer=initializer)
+        var = tf.get_variable(name=name, shape=shape, initializer=initializer,trainable=trainable)
     return var
 
+def batch_norm(inputs, is_training = True, layer_num = 0):
+    idx = str(layer_num)
+    scale = variable_on_worker_level('scale_' + idx, [inputs.get_shape()[-1]], tf.constant_initializer(value=1.0, dtype=tf.float32))
+    beta = variable_on_worker_level('beta' + idx, [inputs.get_shape()[-1]], tf.constant_initializer(value=0.0, dtype=tf.float32))
+    #batch_mean, batch_var = tf.nn.moments(inputs, [0, 1, 2])
+    moving_mean = variable_on_worker_level('movingmean' + idx, [inputs.get_shape()[-1]], tf.constant_initializer(value=0.0, dtype=tf.float32), False)
+    moving_var = variable_on_worker_level('movingvar' + idx, [inputs.get_shape()[-1]], tf.constant_initializer(value=1.0, dtype=tf.float32), False)
+   
 
-def BiRNN(batch_x, seq_length, dropout, reuse=False, batch_size=None, n_steps=-1, previous_state=None, tflite=False):
+    mean, var = tf.nn.moments(inputs,[0, 1, 2])
+    #print (mean.get_shape())
+    update_moving_mean = moving_averages.assign_moving_average(moving_mean, mean, 0.999)
+    update_moving_var = moving_averages.assign_moving_average(moving_var, var, 0.999)
+    tf.add_to_collection('lstm_update_ops', update_moving_mean)
+    tf.add_to_collection('lstm_update_ops', update_moving_var)
+    
+    mean, var = control_flow_ops.cond(tf.convert_to_tensor(is_training, dtype=tf.bool, name = 'is_3d_training'),  lambda: (mean, var), lambda: (moving_mean, moving_var))
+
+    return tf.nn.batch_normalization(inputs, mean, var, beta, scale, 0.001)
+
+     
+def batch_norm_2d(inputs, is_training = True, layer_num = 0):
+    idx = str(layer_num)
+    scale = variable_on_worker_level('scale_' + idx, [inputs.get_shape()[-1]], tf.constant_initializer(value=1.0, dtype=tf.float32))
+    beta = variable_on_worker_level('beta' + idx, [inputs.get_shape()[-1]], tf.constant_initializer(value=0.0, dtype=tf.float32))
+    #batch_mean, batch_var = tf.nn.moments(inputs, [0, 1, 2])
+    moving_mean = variable_on_worker_level('movingmean' + idx, [inputs.get_shape()[-1]], tf.constant_initializer(value=0.0, dtype=tf.float32), False)
+    moving_var = variable_on_worker_level('movingvar' + idx, [inputs.get_shape()[-1]], tf.constant_initializer(value=1.0, dtype=tf.float32), False)
+
+    mean, var = tf.nn.moments(inputs, [0, 1])
+    update_moving_mean = moving_averages.assign_moving_average(moving_mean, mean, 0.999)
+    update_moving_var = moving_averages.assign_moving_average(moving_var, var, 0.999)
+    tf.add_to_collection('lstm_update_ops', update_moving_mean)
+    tf.add_to_collection('lstm_update_ops', update_moving_var)
+
+    mean, var = control_flow_ops.cond(tf.convert_to_tensor(is_training, dtype=tf.bool, name = 'is_2d_training'),  lambda: (mean, var), lambda: (moving_mean, moving_var))
+
+    return tf.nn.batch_normalization(inputs, mean, var, beta, scale, 0.001)
+
+def feed_forward(x, num_hiddens, activation=None, reuse=False):
+    with tf.variable_scope('feed-forward2', reuse=reuse):
+        ff = tf.layers.dense(x, num_hiddens, activation=activation, reuse=tf.AUTO_REUSE)
+    return ff
+
+
+def linear(x, num_hiddens=None, reuse=False):
+    if num_hiddens is None:
+        num_hiddens = x.get_shape().as_list()[-1]
+    with tf.variable_scope(tf.get_variable_scope()):
+        linear_layer = tf.layers.dense(x, num_hiddens,reuse=tf.AUTO_REUSE)
+    return linear_layer
+
+
+def dropout(x, is_training, rate=0.2):
+    return tf.layers.dropout(x, rate, training=tf.convert_to_tensor(is_training))
+
+
+def residual(x_in, x_out, reuse=False):
+    with tf.variable_scope('residual', reuse=reuse):
+        res_con = x_in + x_out
+    return res_con
+
+
+
+def stacked_multihead_attention(x, num_blocks, num_heads, use_residual, is_training, reuse=False):
+    num_hiddens = x.get_shape().as_list()[-1]
+    with tf.variable_scope('stacked_multihead_attention', reuse=reuse):
+        for i in range(num_blocks):
+            with tf.variable_scope('multihead_block_{}'.format(i), reuse=tf.AUTO_REUSE):
+                x = batch_norm_2d(x,is_training,i+3)
+                x, attentions = multihead_attention(x, x, x, use_residual, is_training, num_heads=num_heads, reuse=reuse)
+                x = feed_forward(x, num_hiddens=num_hiddens, activation=tf.nn.relu, reuse=reuse)
+            #if i % 5 == 0 and i != 0: 
+                #x = tf.nn.pool(x,[1,2,2],[1,1,1],padding='valid')
+    return x, attentions
+
+
+def multihead_attention(queries, keys, values, use_residual, is_training, num_units=None, num_heads=8, reuse=False):
+    with tf.variable_scope('multihead-attention', reuse=reuse):
+        if num_units is None:
+            num_units = queries.get_shape().as_list()[-1]
+        Q = linear(queries)
+        K = linear(keys)
+        V = linear(values)
+
+        Q = tf.concat(tf.split(Q, num_heads, axis=2), axis=0)
+        K = tf.concat(tf.split(K, num_heads, axis=2), axis=0)
+        V = tf.concat(tf.split(V, num_heads, axis=2), axis=0)
+
+        Q_K_V, attentions = scaled_dot_product_attention(Q, K, V)
+        Q_K_V = dropout(Q_K_V, is_training)
+        Q_K_V_ = tf.concat(tf.split(Q_K_V, num_heads, axis=0), axis=2)
+
+        output = feed_forward(Q_K_V_, num_units, reuse=reuse)
+
+        if use_residual:
+            output = residual(output, queries, reuse=reuse)
+
+    return output, attentions
+
+
+def scaled_dot_product_attention(queries, keys, values, model_size=None, reuse=False):
+    if model_size is None:
+        model_size = tf.to_float(queries.get_shape().as_list()[-1])
+
+    with tf.variable_scope('scaled_dot_product_attention', reuse=reuse):
+        keys_T = tf.transpose(keys, [0, 2, 1])
+        Q_K = tf.matmul(queries, keys_T) / tf.sqrt(model_size)
+        attentions = tf.nn.softmax(Q_K)
+        scaled_dprod_att = tf.matmul(attentions, values)
+    return scaled_dprod_att, attentions
+
+
+def CNN(batch_x, dropout, is_training=True):
+    
+    batch_size = tf.shape(batch_x)[0]
+
+    batch_x = tf.reshape(batch_x,[batch_size, -1, 143,1])
+    batch_x_shape = tf.shape(batch_x)
+    
+
+    # 1st layer
+    b1 = variable_on_worker_level('b1', [1], tf.zeros_initializer())
+    h1 = variable_on_worker_level('h1', [3, 3, 1, 1], tf.contrib.layers.xavier_initializer())
+    layer_1 = tf.nn.relu(tf.nn.conv2d(batch_x, h1, strides = [1, 1, 1, 1], padding = 'SAME') + b1)
+    layer_1 = batch_norm(layer_1, is_training, 1)
+    layer_1 = tf.minimum(layer_1, 24)
+    layer_1 = tf.nn.dropout(layer_1, 1-dropout[0])
+
+    # 2nd layer
+    b2 = variable_on_worker_level('b2', [1], tf.zeros_initializer())
+    h2 = variable_on_worker_level('h2', [5, 11, 1, 1], tf.contrib.layers.xavier_initializer())
+    layer_2 = tf.nn.relu(tf.nn.conv2d(layer_1, h2, strides = [1, 1, 1, 1], padding = 'SAME') + b2)
+    layer_2 = batch_norm(layer_2, is_training, 2)    
+    layer_2 = tf.minimum(layer_2, 24)
+    layer_2 = tf.nn.dropout(layer_2, 1-dropout[0])
+
+    # 3rd layer
+    b3 = variable_on_worker_level('b3', [1], tf.zeros_initializer())
+    h3 = variable_on_worker_level('h3', [11, 41, 1, 1], tf.contrib.layers.xavier_initializer())
+    layer_3 = tf.nn.relu(tf.nn.conv2d(layer_2, h3, strides = [1, 3, 2, 1], padding = 'SAME') + b3)
+    layer_3 = batch_norm(layer_3, is_training, 3)    
+    layer_3 = tf.minimum(layer_3, 24)
+    layer_3 = tf.nn.dropout(layer_3, 1-dropout[0])
+
+    # 4th layer
+    b4 = variable_on_worker_level('b4', [1], tf.zeros_initializer())
+    h4 = variable_on_worker_level('h4', [11, 41, 1, 1], tf.contrib.layers.xavier_initializer())
+    layer_4 = tf.nn.relu(tf.nn.conv2d(layer_3, h4, strides = [1, 1, 2, 1], padding = 'SAME') + b4)
+    layer_4 = batch_norm(layer_4, is_training, 4)    
+    layer_4 = tf.minimum(layer_4, 24)
+    layer_4 = tf.nn.dropout(layer_4, 1-dropout[0])
+
+
+    layer_4 = tf.reshape(layer_4, (batch_x_shape[0], -1, 36 * 1))
+    layer_4 = tf.transpose(layer_4, [1, 0, 2])
+    layer_4 = tf.reshape(layer_4, (-1, 36 * 1))
+    
+
+    b5 = variable_on_worker_level('b5', [Config.n_hidden_6], tf.zeros_initializer())
+    h5 = variable_on_worker_level('h5', [36*1, Config.n_hidden_6], tf.contrib.layers.xavier_initializer())
+    layer_5 = tf.add(tf.matmul(layer_4, h5), b5)
+    layer_5 = tf.reshape(layer_5, [-1, batch_x_shape[0], Config.n_hidden_6], name="logits")
+    return layer_5
+    # Output shape: [n_steps, batch_size, Config.n_hidden_6]
+
+def SAN(batch_x, batch_size=None, n_steps=-1, is_training=True):
+    
+    #encoder
+    
+    if batch_size is None:
+        batch_size = tf.shape(batch_x)[0]
+
+    batch_x = tf.reshape(batch_x,[batch_size, n_steps, 143,1])
+    batch_x_shape = tf.shape(batch_x)
+    
+    b1 = variable_on_worker_level('b1', [32], tf.zeros_initializer())
+    h1 = variable_on_worker_level('h1', [11, 41, 1, 32], tf.contrib.layers.xavier_initializer())
+    layer_1 = tf.nn.relu(tf.nn.conv2d(batch_x, h1, strides = [1, 3, 2, 1], padding = 'SAME') + b1)
+    layer_1 = batch_norm(layer_1, is_training, 1)
+    layer_1 = tf.minimum(layer_1, 24)
+
+    b2 = variable_on_worker_level('b2', [32], tf.zeros_initializer())
+    h2 = variable_on_worker_level('h2', [7, 21, 32, 32], tf.contrib.layers.xavier_initializer())
+    layer_2 = tf.nn.relu(tf.nn.conv2d(layer_1, h2, strides = [1, 1, 2, 1], padding = 'SAME') + b2)
+    layer_2 = batch_norm(layer_2, is_training, 2)
+    layer_2 = tf.minimum(layer_2, 24)
+
+    '''
+    layer_2 = tf.reshape(layer_2, (batch_x_shape[0], -1, 36 * 32))
+    layer_2 = tf.transpose(layer_2, [1, 0, 2])
+    layer_2 = tf.reshape(layer_2, (-1, 36 * 32))
+
+    b3 = variable_on_worker_level('b3', [1024], tf.zeros_initializer())
+    h3 = variable_on_worker_level('h3', [36 * 32, 1024], tf.contrib.layers.xavier_initializer())
+    layer_3 = tf.add(tf.matmul(layer_2, h3), b3)
+    layer_3 = tf.reshape(layer_3, [-1, batch_x_shape[0], 1024])
+    #layer_3 = tf.minimum(layer_3, 24)
+    layer_3 = batch_norm_2d(layer_3, is_training, 3)
+    #print (layer_3.shape)
+
+    gru_fw_cell_1 = tf.contrib.rnn.LSTMBlockCell(1024, reuse = tf.AUTO_REUSE)
+    gru_bw_cell_1 = tf.contrib.rnn.LSTMBlockCell(1024, reuse = tf.AUTO_REUSE)
+    rnn_outputs_1, _ = tf.nn.bidirectional_dynamic_rnn(cell_fw = gru_fw_cell_1, cell_bw = gru_bw_cell_1, inputs = layer_3, dtype = tf.float32, time_major = True)
+    rnn_outputs_1 = tf.concat(rnn_outputs_1, 2)
+    #rnn_outputs_1 = tf.nn.relu(rnn_outputs_1)
+    b4 = variable_on_worker_level('b4', [1024], tf.zeros_initializer())
+    h4 = variable_on_worker_level('h4', [1024*2, 1024], tf.contrib.layers.xavier_initializer())
+    rnn_outputs_1 = tf.reshape(rnn_outputs_1, (-1, 1024*2))
+    layer_4 = tf.add(tf.matmul(rnn_outputs_1, h4), b4)
+    layer_4 = tf.reshape(layer_4, [-1, batch_x_shape[0], 1024])    
+    layer_4 = batch_norm_2d(layer_4, is_training, 4)
+
+
+    gru_fw_cell_2 = tf.contrib.rnn.LSTMBlockCell(1024, reuse = tf.AUTO_REUSE)
+    gru_bw_cell_2 = tf.contrib.rnn.LSTMBlockCell(1024, reuse = tf.AUTO_REUSE)
+    rnn_outputs_2, _ = tf.nn.bidirectional_dynamic_rnn(cell_fw = gru_fw_cell_2, cell_bw = gru_bw_cell_2, inputs = layer_4, dtype = tf.float32, time_major = True)
+    rnn_outputs_2 = tf.concat(rnn_outputs_2, 2)
+    #rnn_outputs_2 = tf.nn.relu(rnn_outputs_2)
+    b5 = variable_on_worker_level('b5', [1024], tf.zeros_initializer())
+    h5 = variable_on_worker_level('h5', [1024*2, 1024], tf.contrib.layers.xavier_initializer())
+    rnn_outputs_2 = tf.reshape(rnn_outputs_2, (-1, 1024*2))
+    layer_5 = tf.add(tf.matmul(rnn_outputs_2, h5), b5)
+    layer_5 = tf.reshape(layer_5, [-1, batch_x_shape[0], 1024])    
+    layer_5 = batch_norm_2d(layer_5, is_training, 5)
+    '''
+
+    # print(layer_2) [,,36,32]
+    layer_2 = tf.reshape(layer_2, (batch_x_shape[0], -1, 36 * 32)) #[batch,n_steps,num_hiddens(15808)]
+    #layer_6 = tf.reshape(layer_5, (batch_x_shape[0], -1, 1024)) #[batch,n_steps,num_hiddens(15808)]
+    encoder_out, _ = stacked_multihead_attention(layer_2,
+                                              num_blocks=5,
+                                              num_heads=8,
+                                              use_residual=True,
+                                              is_training=True, #?
+                                              reuse=True)
+    
+    encoder_out = tf.transpose(encoder_out,[1,0,2]) #[n_step, batch, 1152]
+    #print(encoder_out)
+    # [?,?,1152]
+
+    '''
+    embeddings = variable_on_worker_level('embedding', [2752,1024], tf.contrib.layers.xavier_initializer())
+    sos_time_slice = tf.ones([batch_size], dtype=tf.int32, name='SOS') * 2
+    sos_step_embedded = tf.nn.embedding_lookup(embeddings, sos_time_slice)
+    pad_step_embedded = tf.zeros([batch_size, 1152+1024],dtype=tf.float32)
+
+    def initial_fn():
+        initial_elements_finished = (0 >= tf.shape(encoder_out)[0])  # all False at the initial step
+        #print(sos_step_embedded)
+        initial_input = tf.concat((sos_step_embedded, encoder_out[0]), 1)
+        # print(initial_input) 
+        return initial_elements_finished, initial_input
+
+    def sample_fn(time, outputs, state):
+        # 选择logit最大的下标作为sample
+        #print(outputs) #[?,1024]   
+        prediction_id = tf.to_int32(tf.argmax(outputs, axis=1))
+        #print(prediction_id) [?,]
+        return prediction_id
+
+    def next_inputs_fn(time, outputs, state, sample_ids):
+        # 上一个时间节点上的输出类别，获取embedding再作为下一个时间节点的输入
+        #print(sample_ids)
+        pred_embedding = tf.nn.embedding_lookup(embeddings, sample_ids)
+        # 输入是h_i+o_{i-1}+c_i
+        #print(pred_embedding) [?,1024]
+        
+        next_input = tf.concat((pred_embedding, encoder_out[time - 1]), 1)
+        #print(next_input) 
+        elements_finished = (time >= tf.shape(encoder_out)[0])  # this operation produces boolean tensor of [batch_size]
+        all_finished = tf.reduce_all(elements_finished)  # -> boolean scalar
+        next_inputs = tf.cond(all_finished, lambda: pad_step_embedded, lambda: next_input)
+        next_state = state
+        return elements_finished, next_inputs, next_state
+
+    # 自定义helper
+    my_helper = tf.contrib.seq2seq.CustomHelper(initial_fn, sample_fn, next_inputs_fn)
+
+
+    def decode(helper, scope, reuse=None):
+        with tf.variable_scope(scope, reuse=tf.AUTO_REUSE):
+            memory = tf.transpose(encoder_out, [1, 0, 2])
+            attention_mechanism = tf.contrib.seq2seq.BahdanauAttention( \
+                num_units=64, memory=memory, \
+                    memory_sequence_length=encoder_out.get_shape().as_list()[0])
+            cell = tf.contrib.rnn.LSTMCell(num_units=1024)
+            attn_cell = tf.contrib.seq2seq.AttentionWrapper(
+                cell, attention_mechanism, attention_layer_size=64)
+            out_cell = tf.contrib.rnn.OutputProjectionWrapper(
+                attn_cell, 2752, reuse=reuse)
+            # 使用自定义helper的decoder
+            decoder = tf.contrib.seq2seq.BasicDecoder(
+                cell=out_cell, helper=helper,
+                initial_state=out_cell.zero_state(
+                    dtype=tf.float32, batch_size=batch_size))
+            # 获取decode结果
+            final_outputs, final_state, _ = tf.contrib.seq2seq.dynamic_decode( \
+                decoder=decoder, output_time_major=True)
+
+            return final_outputs, final_state
+
+	
+    outputs, _ = decode(my_helper, 'decode')
+    rnn_output, _ = outputs
+
+    #rnn_output = tf.reshape(rnn_output,[-1,1024])
+    #b6 = variable_on_worker_level('b6', [2752], tf.zeros_initializer())
+    #h6 = variable_on_worker_level('h6', [1024, 2752], tf.contrib.layers.xavier_initializer())
+    #layer_6 = tf.add(tf.matmul(rnn_output, h6), b6)
+    #layer_6 = tf.reshape(layer_6, [-1, batch_size, 2752], name="raw_logits")
+    #rnn_output = tf.nn.softmax(rnn_output)
+
+    return rnn_output
+    '''
+
+    encoder_out = tf.layers.dense(encoder_out, units=Config.n_hidden_6,reuse=tf.AUTO_REUSE)
+    return encoder_out
+
+
+def BiRNN(batch_x, dropout, is_training=True):
     r'''
     That done, we will define the learned variables, the weights and biases,
     within the method ``BiRNN()`` which also constructs the neural network.
@@ -70,105 +387,115 @@ def BiRNN(batch_x, seq_length, dropout, reuse=False, batch_size=None, n_steps=-1
     The variables ``h3``, ``h5``, and ``h6`` are similar.
     Likewise, the biases, ``b1``, ``b2``..., hold the biases for the various layers.
     '''
-    layers = {}
+    
+    batch_size = tf.shape(batch_x)[0]
 
-    # Input shape: [batch_size, n_steps, n_input + 2*n_input*n_context]
-    if not batch_size:
-        batch_size = tf.shape(batch_x)[0]
-
-    # Reshaping `batch_x` to a tensor with shape `[n_steps*batch_size, n_input + 2*n_input*n_context]`.
-    # This is done to prepare the batch for input into the first layer which expects a tensor of rank `2`.
-
-    # Permute n_steps and batch_size
-    batch_x = tf.transpose(batch_x, [1, 0, 2, 3])
-    # Reshape to prepare input for first layer
-    batch_x = tf.reshape(batch_x, [-1, Config.n_input + 2*Config.n_input*Config.n_context]) # (n_steps*batch_size, n_input + 2*n_input*n_context)
-    layers['input_reshaped'] = batch_x
-
-    # The next three blocks will pass `batch_x` through three hidden layers with
-    # clipped RELU activation and dropout.
+    batch_x = tf.reshape(batch_x,[batch_size, -1, 143,1])
+    batch_x_shape = tf.shape(batch_x)
+    
 
     # 1st layer
-    b1 = variable_on_worker_level('b1', [Config.n_hidden_1], tf.zeros_initializer())
-    h1 = variable_on_worker_level('h1', [Config.n_input + 2*Config.n_input*Config.n_context, Config.n_hidden_1], tf.contrib.layers.xavier_initializer())
-    layer_1 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(batch_x, h1), b1)), FLAGS.relu_clip)
-    layer_1 = tf.nn.dropout(layer_1, (1.0 - dropout[0]))
-    layers['layer_1'] = layer_1
+    b1 = variable_on_worker_level('b1', [32], tf.zeros_initializer())
+    h1 = variable_on_worker_level('h1', [11, 41, 1, 32], tf.contrib.layers.xavier_initializer())
+    layer_1 = tf.nn.relu(tf.nn.conv2d(batch_x, h1, strides = [1, 3, 2, 1], padding = 'SAME') + b1)
+    layer_1 = batch_norm(layer_1, is_training, 1)
+    #layer_1 = tf.nn.relu((tf.nn.conv2d(batch_x, h1, strides = [1, 3, 2, 1], padding = 'SAME') + b1))
+    layer_1 = tf.minimum(layer_1, 24)
+    #layer_1 = tf.nn.dropout(layer_1, 1-dropout[0])
 
     # 2nd layer
-    b2 = variable_on_worker_level('b2', [Config.n_hidden_2], tf.zeros_initializer())
-    h2 = variable_on_worker_level('h2', [Config.n_hidden_1, Config.n_hidden_2], tf.contrib.layers.xavier_initializer())
-    layer_2 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(layer_1, h2), b2)), FLAGS.relu_clip)
-    layer_2 = tf.nn.dropout(layer_2, (1.0 - dropout[1]))
-    layers['layer_2'] = layer_2
+    b2 = variable_on_worker_level('b2', [32], tf.zeros_initializer())
+    h2 = variable_on_worker_level('h2', [11, 41, 32, 32], tf.contrib.layers.xavier_initializer())
+    layer_2 = tf.nn.relu(tf.nn.conv2d(layer_1, h2, strides = [1, 1, 2, 1], padding = 'SAME') + b2)
+    layer_2 = batch_norm(layer_2, is_training, 2)    
+    #layer_2 = tf.nn.relu((tf.nn.conv2d(layer_1, h2, strides = [1, 1, 2, 1], padding = 'SAME') + b2))
+    layer_2 = tf.minimum(layer_2, 24)
+    #layer_2 = tf.nn.dropout(layer_2, 1-dropout[0])
 
+
+    layer_2 = tf.reshape(layer_2, (batch_x_shape[0], -1, 36 * 32))  #?
+    layer_2 = tf.transpose(layer_2, [1, 0, 2])
+    layer_2 = tf.reshape(layer_2, (-1, 36 * 32)) #?
+    
     # 3rd layer
-    b3 = variable_on_worker_level('b3', [Config.n_hidden_3], tf.zeros_initializer())
-    h3 = variable_on_worker_level('h3', [Config.n_hidden_2, Config.n_hidden_3], tf.contrib.layers.xavier_initializer())
-    layer_3 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(layer_2, h3), b3)), FLAGS.relu_clip)
-    layer_3 = tf.nn.dropout(layer_3, (1.0 - dropout[2]))
-    layers['layer_3'] = layer_3
+    b3 = variable_on_worker_level('b3', [1024], tf.zeros_initializer())
+    h3 = variable_on_worker_level('h3', [36 * 32, 1024], tf.contrib.layers.xavier_initializer())
+    layer_3 = tf.add(tf.matmul(layer_2, h3), b3)
+    layer_3 = tf.reshape(layer_3, [-1, batch_x_shape[0], 1024])
+    layer_3 = tf.minimum(layer_3, 24)
+    #layer_3 = tf.contrib.layers.layer_norm(layer_3,scope='ln_3')
+    #layer_3 = batch_norm_2d(layer_3, is_training, 3)
+    #print (layer_3.shape)
+    #layer_3 = tf.nn.dropout(layer_3, 1-dropout[0])
 
-    # Now we create the forward and backward LSTM units.
-    # Both of which have inputs of length `n_cell_dim` and bias `1.0` for the forget gate of the LSTM.
+    gru_fw_cell_1 = tf.contrib.rnn.LSTFMBlockCell(1024, reuse = tf.AUTO_REUSE)
+    gru_bw_cell_1 = tf.contrib.rnn.LSTMBlockCell(1024, reuse = tf.AUTO_REUSE)
+    rnn_outputs_1, _ = tf.nn.bidirectional_dynamic_rnn(cell_fw = gru_fw_cell_1, cell_bw = gru_bw_cell_1, inputs = layer_3, dtype = tf.float32, time_major = True)
+    rnn_outputs_1 = tf.concat(rnn_outputs_1, 2)
+    #rnn_outputs_1 = tf.nn.relu(rnn_outputs_1)
+    b4 = variable_on_worker_level('b4', [1024], tf.zeros_initializer())
+    h4 = variable_on_worker_level('h4', [1024*2, 1024], tf.contrib.layers.xavier_initializer())
+    rnn_outputs_1 = tf.reshape(rnn_outputs_1, (-1, 1024*2))
+    layer_4 = tf.add(tf.matmul(rnn_outputs_1, h4), b4)
+    layer_4 = tf.reshape(layer_4, [-1, batch_x_shape[0], 1024])    
+    layer_4 = tf.contrib.layers.layer_norm(layer_4,scope='ln_4')
+    #layer_4 = batch_norm_2d(layer_4, is_training, 4)
+    #layer_4 = tf.nn.dropout(layer_4, 0.9)
 
-    # Forward direction cell:
-    if not tflite:
-        fw_cell = tf.contrib.rnn.LSTMBlockFusedCell(Config.n_cell_dim, reuse=reuse)
-        layers['fw_cell'] = fw_cell
-    else:
-        fw_cell = tf.nn.rnn_cell.LSTMCell(Config.n_cell_dim, reuse=reuse)
+    gru_fw_cell_2 = tf.contrib.rnn.LSTMBlockCell(1024, reuse = tf.AUTO_REUSE)
+    gru_bw_cell_2 = tf.contrib.rnn.LSTMBlockCell(1024, reuse = tf.AUTO_REUSE)
+    rnn_outputs_2, _ = tf.nn.bidirectional_dynamic_rnn(cell_fw = gru_fw_cell_2, cell_bw = gru_bw_cell_2, inputs = layer_4, dtype = tf.float32, time_major = True)
+    rnn_outputs_2 = tf.concat(rnn_outputs_2, 2)
+    #rnn_outputs_2 = tf.nn.relu(rnn_outputs_2)
+    b5 = variable_on_worker_level('b5', [1024], tf.zeros_initializer())
+    h5 = variable_on_worker_level('h5', [1024*2, 1024], tf.contrib.layers.xavier_initializer())
+    rnn_outputs_2 = tf.reshape(rnn_outputs_2, (-1, 1024*2))
+    layer_5 = tf.add(tf.matmul(rnn_outputs_2, h5), b5)
+    layer_5 = tf.reshape(layer_5, [-1, batch_x_shape[0], 1024])
+    layer_5 = tf.contrib.layers.layer_norm(layer_5,scope='ln_5')  
+    #layer_5 = batch_norm_2d(layer_5, is_training, 5)
+    #layer_5 = tf.nn.dropout(layer_5, 0.9)
 
-    # `layer_3` is now reshaped into `[n_steps, batch_size, 2*n_cell_dim]`,
-    # as the LSTM RNN expects its input to be of shape `[max_time, batch_size, input_size]`.
-    layer_3 = tf.reshape(layer_3, [n_steps, batch_size, Config.n_hidden_3])
-    if tflite:
-        # Generated StridedSlice, not supported by NNAPI
-        #n_layer_3 = []
-        #for l in range(layer_3.shape[0]):
-        #    n_layer_3.append(layer_3[l])
-        #layer_3 = n_layer_3
+    gru_fw_cell_3 = tf.contrib.rnn.LSTMBlockCell(1024, reuse = tf.AUTO_REUSE)
+    gru_bw_cell_3 = tf.contrib.rnn.LSTMBlockCell(1024, reuse = tf.AUTO_REUSE)
+    rnn_outputs_3, _ = tf.nn.bidirectional_dynamic_rnn(cell_fw = gru_fw_cell_3, cell_bw = gru_bw_cell_3, inputs = layer_5, dtype = tf.float32, time_major = True)
+    rnn_outputs_3 = tf.concat(rnn_outputs_3, 2)
+    #rnn_outputs_2 = tf.nn.relu(rnn_outputs_2)
+    b6 = variable_on_worker_level('b6', [1024], tf.zeros_initializer())
+    h6 = variable_on_worker_level('h6', [1024*2, 1024], tf.contrib.layers.xavier_initializer())
+    rnn_outputs_3 = tf.reshape(rnn_outputs_3, (-1, 1024*2))
+    layer_6 = tf.add(tf.matmul(rnn_outputs_3, h6), b6)
+    layer_6 = tf.reshape(layer_6, [-1, batch_x_shape[0], 1024])
+    layer_6 = tf.contrib.layers.layer_norm(layer_6,scope='ln_6')  
+    #layer_5 = batch_norm_2d(layer_5, is_training, 5)
+    #layer_5 = tf.nn.dropout(layer_5, 0.9)
 
-        # Unstack/Unpack is not supported by NNAPI
-        layer_3 = tf.unstack(layer_3, n_steps)
+    gru_fw_cell_4 = tf.contrib.rnn.LSTMBlockCell(1024, reuse = tf.AUTO_REUSE)
+    gru_bw_cell_4 = tf.contrib.rnn.LSTMBlockCell(1024, reuse = tf.AUTO_REUSE)
+    rnn_outputs_4, _ = tf.nn.bidirectional_dynamic_rnn(cell_fw = gru_fw_cell_4, cell_bw = gru_bw_cell_4, inputs = layer_6, dtype = tf.float32, time_major = True)
+    rnn_outputs_4 = tf.concat(rnn_outputs_4, 2)
+    b7 = variable_on_worker_level('b7', [Config.n_hidden_6], tf.zeros_initializer())
+    h7 = variable_on_worker_level('h7', [1024*2, Config.n_hidden_6], tf.contrib.layers.xavier_initializer())
+    rnn_outputs_4 = tf.reshape(rnn_outputs_4, (-1, 1024*2))
+    layer_7 = tf.add(tf.matmul(rnn_outputs_4, h7), b7)
+    layer_7 = tf.reshape(layer_7, [-1, batch_x_shape[0], Config.n_hidden_6], name="logits")
+    # Output shape: [n_steps, batch_size, Config.n_hidden_6]
+    return layer_7
 
-    # We parametrize the RNN implementation as the training and inference graph
-    # need to do different things here.
-    if not tflite:
-        output, output_state = fw_cell(inputs=layer_3, dtype=tf.float32, sequence_length=seq_length, initial_state=previous_state)
-    else:
-        output, output_state = tf.nn.static_rnn(fw_cell, layer_3, previous_state, tf.float32)
-        output = tf.concat(output, 0)
+    '''
+    san_input = tf.reshape(layer_5, (batch_x_shape[0], -1, 1024)) #[batch,n_steps,num_hiddens(15808)]
 
-    # Reshape output from a tensor of shape [n_steps, batch_size, n_cell_dim]
-    # to a tensor of shape [n_steps*batch_size, n_cell_dim]
-    output = tf.reshape(output, [-1, Config.n_cell_dim])
-    layers['rnn_output'] = output
-    layers['rnn_output_state'] = output_state
-
-    # Now we feed `output` to the fifth hidden layer with clipped RELU activation and dropout
-    b5 = variable_on_worker_level('b5', [Config.n_hidden_5], tf.zeros_initializer())
-    h5 = variable_on_worker_level('h5', [Config.n_cell_dim, Config.n_hidden_5], tf.contrib.layers.xavier_initializer())
-    layer_5 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(output, h5), b5)), FLAGS.relu_clip)
-    layer_5 = tf.nn.dropout(layer_5, (1.0 - dropout[5]))
-    layers['layer_5'] = layer_5
-
-    # Now we apply the weight matrix `h6` and bias `b6` to the output of `layer_5`
-    # creating `n_classes` dimensional vectors, the logits.
-    b6 = variable_on_worker_level('b6', [Config.n_hidden_6], tf.zeros_initializer())
-    h6 = variable_on_worker_level('h6', [Config.n_hidden_5, Config.n_hidden_6], tf.contrib.layers.xavier_initializer())
-    layer_6 = tf.add(tf.matmul(layer_5, h6), b6)
-    layers['layer_6'] = layer_6
-
-    # Finally we reshape layer_6 from a tensor of shape [n_steps*batch_size, n_hidden_6]
-    # to the slightly more useful shape [n_steps, batch_size, n_hidden_6].
-    # Note, that this differs from the input in that it is time-major.
-    layer_6 = tf.reshape(layer_6, [n_steps, batch_size, Config.n_hidden_6], name="raw_logits")
-    layers['raw_logits'] = layer_6
-
-    # Output shape: [n_steps, batch_size, n_hidden_6]
-    return layer_6, layers
-
+    encoder_out, _ = stacked_multihead_attention(san_input,
+                                              num_blocks=4,
+                                              num_heads=8,
+                                              use_residual=True,
+                                              is_training=True,
+                                              reuse=True)
+    
+    encoder_out = tf.transpose(encoder_out,[1,0,2])
+    encoder_out = tf.layers.dense(encoder_out, units=Config.Config.,reuse=tf.AUTO_REUSE)
+    return encoder_out
+    '''
 
 # Accuracy and Loss
 # =================
@@ -189,12 +516,16 @@ def calculate_mean_edit_distance_and_loss(model_feeder, tower, dropout, reuse):
     # Obtain the next batch of data
     batch_x, batch_seq_len, batch_y = model_feeder.next_batch(tower)
 
-    # Calculate the logits of the batch using BiRNN
-    logits, _ = BiRNN(batch_x, batch_seq_len, dropout, reuse)
-
+    # Calculate the logits of the batch using
+    logits = CNN(batch_x,dropout)
+    
+    
+    #print(logits)
+    #print(batch_y)
     # Compute the CTC loss using TensorFlow's `ctc_loss`
-    total_loss = tf.nn.ctc_loss(labels=batch_y, inputs=logits, sequence_length=batch_seq_len)
-
+    total_loss = tf.nn.ctc_loss(labels=batch_y, inputs=logits, sequence_length=tf.to_int32(tf.ceil(batch_seq_len/3)),ignore_longer_outputs_than_inputs=True)
+    #total_loss = tf.nn.ctc_loss(labels=batch_y, inputs=logits, sequence_length=batch_seq_len)
+    #print(total_loss)
     # Calculate the average loss across the batch
     avg_loss = tf.reduce_mean(total_loss)
 
@@ -302,7 +633,9 @@ def average_gradients(tower_gradients):
             # Loop over the gradients for the current variable
             for g, _ in grad_and_vars:
                 # Add 0 dimension to the gradients to represent the tower.
-                expanded_g = tf.expand_dims(g, 0)
+                #print(g)
+                if g is not None:
+                    expanded_g = tf.expand_dims(g, 0)
                 # Append on a 'tower' dimension which we will average over below.
                 grads.append(expanded_g)
 
@@ -429,9 +762,11 @@ def train(server=None):
 
     # Get the data_set specific graph end-points
     gradients, loss = get_tower_results(model_feeder, optimizer, dropout_rates)
+    
 
     # Average tower gradients across GPUs
     avg_tower_gradients = average_gradients(gradients)
+    #print(avg_tower_gradients)
 
     # Add summaries of all variables and gradients to log
     log_grads_and_vars(avg_tower_gradients)
@@ -659,33 +994,38 @@ def test():
                            Config.alphabet,
                            hdf5_cache_path=FLAGS.test_cached_features_path)
 
-    graph = create_inference_graph(batch_size=FLAGS.test_batch_size, n_steps=-1)
+    graph = create_inference_graph(batch_size=FLAGS.test_batch_size)
     evaluate.evaluate(test_data, graph)
 
-
+'''
 def create_inference_graph(batch_size=1, n_steps=16, tflite=False):
     # Input tensor will be of shape [batch_size, n_steps, 2*n_context+1, n_input]
     input_tensor = tf.placeholder(tf.float32, [batch_size, n_steps if n_steps > 0 else None, 2*Config.n_context+1, Config.n_input], name='input_node')
     seq_length = tf.placeholder(tf.int32, [batch_size], name='input_lengths')
 
     if not tflite:
-        previous_state_c = variable_on_worker_level('previous_state_c', [batch_size, Config.n_cell_dim], initializer=None)
-        previous_state_h = variable_on_worker_level('previous_state_h', [batch_size, Config.n_cell_dim], initializer=None)
+        previous_state_c = variable_on_worker_level('previous_state_c', [batch_size, 2*Config.n_cell_dim], initializer=None)
+        previous_state_h = variable_on_worker_level('previous_state_h', [batch_size, 2*Config.n_cell_dim], initializer=None)
     else:
-        previous_state_c = tf.placeholder(tf.float32, [batch_size, Config.n_cell_dim], name='previous_state_c')
-        previous_state_h = tf.placeholder(tf.float32, [batch_size, Config.n_cell_dim], name='previous_state_h')
+        previous_state_c = tf.placeholder(tf.float32, [batch_size, 2*Config.n_cell_dim], name='previous_state_c')
+        previous_state_h = tf.placeholder(tf.float32, [batch_size, 2*Config.n_cell_dim], name='previous_state_h')
 
     previous_state = tf.contrib.rnn.LSTMStateTuple(previous_state_c, previous_state_h)
 
     no_dropout = [0.0] * 6
 
-    logits, layers = BiRNN(batch_x=input_tensor,
+    #logits, layers = BiRNN(batch_x=input_tensor,
+                           #seq_length=seq_length if FLAGS.use_seq_length else None,
+                           #dropout=no_dropout,
+                           #batch_size=batch_size,
+                           #n_steps=n_steps,
+                           #previous_state=previous_state,
+                           #tflite=tflite)
+
+    logits, layers = SAN(batch_x=input_tensor,
                            seq_length=seq_length if FLAGS.use_seq_length else None,
-                           dropout=no_dropout,
-                           batch_size=batch_size,
-                           n_steps=n_steps,
-                           previous_state=previous_state,
-                           tflite=tflite)
+                           dropout=no_dropout)
+    
 
     # TF Lite runtime will check that input dimensions are 1, 2 or 4
     # by default we get 3, the middle one being batch_size which is forced to
@@ -697,10 +1037,11 @@ def create_inference_graph(batch_size=1, n_steps=16, tflite=False):
     logits = tf.nn.softmax(logits)
 
     new_state_c, new_state_h = layers['rnn_output_state']
+    
 
     # Initial zero state
     if not tflite:
-        zero_state = tf.zeros([batch_size, Config.n_cell_dim], tf.float32)
+        zero_state = tf.zeros([batch_size, 2*Config.n_cell_dim], tf.float32)
         initialize_c = tf.assign(previous_state_c, zero_state)
         initialize_h = tf.assign(previous_state_h, zero_state)
         initialize_state = tf.group(initialize_c, initialize_h, name='initialize_state')
@@ -736,6 +1077,33 @@ def create_inference_graph(batch_size=1, n_steps=16, tflite=False):
             },
             layers
         )
+'''
+
+def create_inference_graph(batch_size=None,n_steps=-1):
+    # Input tensor will be of shape [batch_size, n_steps, n_input + 2*n_input*n_context]
+    input_tensor = tf.placeholder(tf.float32, [batch_size, n_steps if n_steps > 0 else None, 2*Config.n_context+1, Config.n_input], name='input_node')
+    seq_length = tf.placeholder(tf.int32, [batch_size], name='input_lengths')
+    is_training = tf.placeholder(tf.bool, name = 'training_phase')
+    dropout = [0.0] * 6
+    # Calculate the logits of the batch using SAN
+    logits = CNN(batch_x=input_tensor,dropout=dropout, is_training=is_training)
+    #logits = BiRNN(input_tensor)
+    #print (logits.shape)
+    
+    
+
+    return (
+        {
+            'input': input_tensor,
+            'input_lengths': seq_length,
+            'training_phase': is_training,
+            
+        },
+        {
+            'outputs': logits,
+        }
+    )
+
 
 
 def export():
@@ -748,13 +1116,12 @@ def export():
 
         tf.reset_default_graph()
         session = tf.Session(config=Config.session_config)
-
-        inputs, outputs, _ = create_inference_graph(batch_size=1, n_steps=FLAGS.n_steps, tflite=FLAGS.export_tflite)
+        inputs, outputs = create_inference_graph(batch_size=1)
         input_names = ",".join(tensor.op.name for tensor in inputs.values())
         output_names_tensors = [ tensor.op.name for tensor in outputs.values() if isinstance(tensor, Tensor) ]
         output_names_ops = [ tensor.name for tensor in outputs.values() if isinstance(tensor, Operation) ]
         output_names = ",".join(output_names_tensors + output_names_ops)
-        input_shapes = ":".join(",".join(map(str, tensor.shape)) for tensor in inputs.values())
+        #input_shapes = ":".join(",".join(map(str, tensor.shape)) for tensor in inputs.values())
 
         if not FLAGS.export_tflite:
             mapping = {v.op.name: v for v in tf.global_variables() if not v.op.name.startswith('previous_state_')}
@@ -809,11 +1176,10 @@ def export():
                         self.graph_def_file = temp_freeze
                         self.inference_type = 'FLOAT'
                         self.input_arrays   = input_names
-                        self.input_shapes   = input_shapes
+                        #self.input_shapes   = input_shapes
                         self.output_arrays  = output_names
                         self.output_file    = output_tflite_path
                         self.output_format  = 'TFLITE'
-                        self.post_training_quantize = True
 
                         default_empty = [
                             'inference_input_type',
@@ -824,6 +1190,7 @@ def export():
                             'change_concat_input_ranges',
                             'allow_custom_ops',
                             'converter_mode',
+                            'post_training_quantize',
                             'dump_graphviz_dir',
                             'dump_graphviz_video'
                         ]
@@ -841,8 +1208,8 @@ def export():
 
 def do_single_file_inference(input_file_path):
     with tf.Session(config=Config.session_config) as session:
-        inputs, outputs, _ = create_inference_graph(batch_size=1, n_steps=-1)
-
+        #inputs, outputs = create_inference_graph(batch_size=1, n_steps=-1)
+        inputs, outputs = create_inference_graph(batch_size=1)
         # Create a saver using variables from the above newly created graph
         mapping = {v.op.name: v for v in tf.global_variables() if not v.op.name.startswith('previous_state_')}
         saver = tf.train.Saver(mapping)
@@ -858,7 +1225,7 @@ def do_single_file_inference(input_file_path):
         checkpoint_path = checkpoint.model_checkpoint_path
         saver.restore(session, checkpoint_path)
 
-        session.run(outputs['initialize_state'])
+        #session.run(outputs['initialize_state'])
 
         features = audiofile_to_input_vector(input_file_path, Config.n_input, Config.n_context)
         num_strides = len(features) - (Config.n_context * 2)
@@ -875,16 +1242,23 @@ def do_single_file_inference(input_file_path):
         logits = session.run(outputs['outputs'], feed_dict = {
             inputs['input']: [features],
             inputs['input_lengths']: [num_strides],
+            inputs['training_phase']: False,
         })
 
-        logits = np.squeeze(logits)
-
-        scorer = Scorer(FLAGS.lm_alpha, FLAGS.lm_beta,
-                        FLAGS.lm_binary_path, FLAGS.lm_trie_path,
-                        Config.alphabet)
-        decoded = ctc_beam_search_decoder(logits, Config.alphabet, FLAGS.beam_width, scorer=scorer)
+        #logits = np.squeeze(logits)
+        #print(np.shape(logits))
+        #np.save('logits.npy', logits)
+        #logits = np.exp(logits) / np.expand_dims(np.sum(np.exp(logits),axis=1),axis=1)
+        #scorer = Scorer(FLAGS.lm_alpha, FLAGS.lm_beta,
+                        #FLAGS.lm_binary_path, FLAGS.lm_trie_path,
+                        #Config.alphabet)
+        #decoded = ctc_beam_search_decoder(logits, Config.alphabet, FLAGS.beam_width, scorer=scorer)
+        
+        index = list(np.argsort(logits)[0,:,-1])
+        words =  ' '.join([Config.alphabet.string_from_label(a) for a in index])
+        print(words)        
         # Print highest probability result
-        print(decoded[0][1])
+        #print(decoded[0][1])
 
 
 def main(_):
@@ -944,3 +1318,5 @@ def main(_):
 if __name__ == '__main__' :
     create_flags()
     tf.app.run(main)
+
+
